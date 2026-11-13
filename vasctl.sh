@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 
 APP_NAME="VASController"
-APP_VERSION="1.1.0"
+APP_VERSION="1.1.1"
 APP_AUTHOR="FabDotNET"
 APP_BIN="$(basename "$0")"
 APP_PATH="$(readlink -f "$0")"
@@ -17,6 +17,9 @@ GB_COMPOSE_URL="${GB_COMPOSE_URL:-https://greenbone.github.io/docs/latest/_stati
 GB_GSA_URL="${GB_GSA_URL:-https://127.0.0.1}"            # nginx + self-signed TLS (official compose)
 GB_START_TIMEOUT="${GB_START_TIMEOUT:-600}"      # max seconds to wait for GSA
 GB_FEED_SCHEDULE="${GB_FEED_SCHEDULE:-*-*-* 01:00:00}"   # systemd OnCalendar for nightly feed updates
+GB_PULL_RETRIES="${GB_PULL_RETRIES:-4}"          # attempts per image pull (VM NAT / laptop sleep make big pulls flaky)
+GB_FEED_LOCK="${GB_FEED_LOCK:-/run/vasctl-feed.lock}"   # serializes update-feed runs (timer + manual)
+GB_DATA_COPY_TIMEOUT="${GB_DATA_COPY_TIMEOUT:-5400}"     # max seconds for feed containers to copy data into volumes
 
 ASSUME_YES="${ASSUME_YES:-0}"
 
@@ -81,6 +84,78 @@ dc() {
 }
 # Base compose only (ignores the lock)
 dc_base() { docker compose -f "$GB_DIR/docker-compose.yml" -p "$GB_PROJECT" "$@"; }
+
+# Feed data containers still copying into their volume although Docker already flags them
+# "unhealthy": on a slow (virtual) disk, copying ~11 GB of SCAP data takes longer than the
+# healthcheck window baked into the image (scap-data: 300 s start period + 3 x 30 s), and
+# 'compose up' then aborts the whole start even though the copy finishes fine later.
+data_copy_pending() {
+  local svc id st out=()
+  for svc in "${FEED_SERVICES[@]}"; do
+    id="$(dc ps -aq "$svc" 2>/dev/null | head -1)" || id=""
+    [[ -n "$id" ]] || continue
+    st="$(docker inspect -f '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$id" 2>/dev/null)" || continue
+    if [[ "$st" == "running unhealthy" || "$st" == "running starting" ]]; then out+=("$svc"); fi
+  done
+  printf '%s' "${out[*]}"
+}
+
+# 'docker compose up -d' that waits for slow feed data copies instead of failing on them
+dc_up_patient() {
+  local attempt=1 pending t0 n=0
+  while :; do
+    if dc up -d "$@"; then return 0; fi
+    pending="$(data_copy_pending)"
+    [[ -n "$pending" ]] || return 1
+    (( attempt >= 3 )) && return 1
+    warn "Feed data is still being copied into the volumes by: $pending"
+    warn "(slow disk: the copy outlasts the containers' healthcheck window) — waiting, then starting again…"
+    t0=$(date +%s)
+    while [[ -n "$(data_copy_pending)" ]]; do
+      (( $(date +%s) - t0 < GB_DATA_COPY_TIMEOUT )) || { warn "Still copying after ${GB_DATA_COPY_TIMEOUT}s (GB_DATA_COPY_TIMEOUT)."; return 1; }
+      n=$(( n + 1 )); (( n % 8 == 0 )) && info "… still copying ($(fmt_duration $(( $(date +%s) - t0 ))))"
+      sleep 15
+    done
+    info "Feed data copied after $(fmt_duration $(( $(date +%s) - t0 ))) more."
+    attempt=$(( attempt + 1 ))
+  done
+}
+
+# One SQL query in the gvmd database, unaligned output (empty on any error)
+pg_q() { dc exec -T -u postgres pg-gvm psql -d gvmd -tAqc "$1" 2>/dev/null | tr -d '\r' || true; }
+
+# 'docker compose pull' with retries. Multi-GB pulls through a hypervisor NAT, a VPN or across a
+# host sleep fail often; layers already downloaded are kept, so a retry resumes where it stopped.
+# Errors a retry cannot fix (disk full) stop at once; a layer corrupted on disk after its
+# download is evicted from containerd's content store so the next attempt fetches it again.
+dc_pull_retry() {
+  local n=1 delay=15 log rc digest
+  log="$(mktemp)"; CLEANUP+=("$log")
+  while :; do
+    if dc pull "$@" 2>&1 | tee "$log"; then rc=0; else rc=1; fi
+    (( rc == 0 )) && return 0
+    if grep -qiE 'no space left on device' "$log"; then
+      warn "Disk full while pulling images: free space first (sudo $APP_BIN disk), retrying is useless."
+      return 1
+    fi
+    if grep -qiE 'invalid tar header|failed to extract layer|unexpected EOF|digest mismatch|checksum' "$log"; then
+      warn "A downloaded layer is corrupted on disk. In a VM this points to the virtual disk or host storage"
+      warn "(VirtualBox: check the host disk, free space on the host, 'Use Host I/O Cache')."
+      while read -r digest; do
+        [[ -n "$digest" ]] || continue
+        if command -v ctr >/dev/null && ctr -n moby content rm "$digest" >/dev/null 2>&1; then
+          info "Evicted corrupted layer $digest from the content store."
+        fi
+      done < <(grep -oE 'failed to extract layer \([^)]*sha256:[0-9a-f]{64}' "$log" | grep -oE 'sha256:[0-9a-f]{64}' | sort -u || true)
+    fi
+    if (( n >= GB_PULL_RETRIES )); then
+      warn "Image pull failed after $n attempts."
+      return 1
+    fi
+    warn "Image pull failed (attempt $n/$GB_PULL_RETRIES), retrying in ${delay}s…"
+    sleep "$delay"; n=$(( n + 1 )); delay=$(( delay * 2 ))
+  done
+}
 
 is_locked() { [[ -f "$GB_DIR/docker-compose.lock.yml" ]]; }
 require_unlocked() {
@@ -260,7 +335,7 @@ cmd_install() {
     info "Lock file from the archive applied: pulling the exact image digests of the source."
   fi
   info "Pulling Greenbone images (several GB, be patient)…"
-  if ! dc pull; then
+  if ! dc_pull_retry; then
     if [[ -n "${GB_LOCK_SRC:-}" ]]; then
       rm -f "$GB_DIR/docker-compose.lock.yml"   # do not leave a lock that would block a retry
       die "Some pinned images are no longer available in the registry: retry without --same-versions, or use a bundle."
@@ -290,9 +365,15 @@ wait_for_gsa() {
 }
 
 feed_hint() {
-  # Check gvmd logs for a feed load still in progress
-  if dc logs --since 15m gvmd 2>/dev/null | grep -qiE 'updating (scap|cert|nvt)|syncing|loading'; then
-    warn "gvmd appears to be still loading the feed: wait before scanning — progress: sudo $APP_BIN feed-status --watch"
+  # gvmd starts its feed jobs a few seconds after GSA answers: give it a moment, then ask its log
+  local act="" i
+  for i in 1 2 3; do
+    act="$(gvmd_activity)" || act=""
+    [[ -n "$act" ]] && break
+    sleep 5
+  done
+  if [[ -n "$act" ]]; then
+    warn "gvmd is loading the feed ($act): wait before scanning — progress: sudo $APP_BIN feed-status --watch"
   else
     info "Before scanning, check the feed is loaded: sudo $APP_BIN feed-status"
   fi
@@ -303,7 +384,7 @@ cmd_start() {
   require_compose_file
   require_docker start
   info "Starting the stack…"
-  dc up -d
+  dc_up_patient || die "The stack did not start: sudo $APP_BIN status / logs <service>"
   wait_for_gsa || true
   feed_hint
   echo
@@ -384,37 +465,129 @@ cmd_versions() {
 }
 
 # ---------- Feed import progress ----------
-# gvmd gives no percentage: progress is derived from what is already in PostgreSQL
-# (NVTs in DB vs .nasl files in the scanner feed) and from gvmd's process titles.
+# gvmd gives no percentage: progress is derived from what is already in PostgreSQL, from the
+# feed versions on disk vs. in the database, and from gvmd's start/end log markers per job.
 
 FEED_POLL="${FEED_POLL:-15}"   # seconds between two polls
 
-# One SQL round-trip: "nvts|cves|cpes|cert_bund|dfn_cert|cves_build|cpes_build" (-1 = table not there)
-# gvmd builds SCAP data in a temporary "scap2" schema and swaps it to "scap" at the end.
+# Row counts "nvts|cves|cpes|cert_bund|dfn_cert|cves_build|cpes_build" (-1 = table not there,
+# -2 = table locked right now). gvmd builds SCAP data in a temporary "scap2" schema and swaps it
+# to "scap" at the end; during parts of that build it holds ACCESS EXCLUSIVE locks on the scap2
+# tables for minutes. One statement per table with a short lock_timeout, so a locked table only
+# costs its own counter instead of freezing the whole dashboard.
 feed_db_counts() {
-  local t q="" sep=""
+  local t sql="SET lock_timeout = '1500ms'; SET statement_timeout = '60s';"$'\n' out v res=()
   for t in nvts scap.cves scap.cpes cert.cert_bund_advs cert.dfn_cert_advs scap2.cves scap2.cpes; do
-    q+="${sep}case when to_regclass('$t') is null then -1 else (xpath('/row/c/text()', query_to_xml('select count(*) as c from $t', false, true, '')))[1]::text::bigint end"
-    sep=" || '|' || "
+    sql+="SELECT '$t=' || CASE WHEN to_regclass('$t') IS NULL THEN -1 ELSE (xpath('/row/c/text()', query_to_xml('select count(*) as c from $t', false, true, '')))[1]::text::bigint END;"$'\n'
   done
-  dc exec -T -u postgres pg-gvm psql -d gvmd -tAqc "select $q" 2>/dev/null | tr -d '[:space:]'
+  out="$(dc exec -T -u postgres pg-gvm psql -d gvmd -tAq <<<"$sql" 2>/dev/null | tr -d '\r')" || true
+  for t in nvts scap.cves scap.cpes cert.cert_bund_advs cert.dfn_cert_advs scap2.cves scap2.cpes; do
+    v="$(grep -m1 "^$t=" <<<"$out" | cut -d= -f2)" || v=""
+    [[ "$v" =~ ^-?[0-9]+$ ]] || v=-2
+    res+=("$v")
+  done
+  local IFS='|'; printf '%s' "${res[*]}"
 }
 
-# Number of NVT scripts shipped by the feed (target for the NVT progress bar)
-feed_nvt_total() {
-  dc exec -T ospd-openvas sh -c 'find /var/lib/openvas/plugins -name "*.nasl" 2>/dev/null | wc -l' 2>/dev/null | tr -d '[:space:]'
+# Start time of a service's container (RFC 3339), for 'docker logs --since'; 24h if unknown
+svc_started_at() {
+  local id t=""
+  id="$(dc ps -q "$1" 2>/dev/null | head -1)" || id=""
+  [[ -n "$id" ]] && { t="$(docker inspect -f '{{.State.StartedAt}}' "$id" 2>/dev/null)" || t=""; }
+  printf '%s' "${t:-24h}"
 }
 
-# Current gvmd background activity, from process titles (e.g. "gvmd: Updating SCAP info")
+# Feed versions present on disk, i.e. what the data containers copied into the volumes
+disk_nvt_version()     { feed_version; }   # PLUGIN_SET, "unknown" if unavailable
+disk_secinfo_version() {                   # scap|cert -> YYYYMMDDhhmm from the feed timestamp file
+  local v
+  v="$(dc exec -T gvmd cat "/var/lib/gvm/$1-data/timestamp" 2>/dev/null | tr -dc '0-9')" || v=""
+  printf '%s' "${v:-unknown}"
+}
+# NVT feed version gvmd has imported into PostgreSQL
+db_nvt_version() { local v; v="$(pg_q "select value from meta where name='nvts_feed_version'")"; printf '%s' "${v:-none}"; }
+
+# State of gvmd's feed jobs from its log, since $1 (default: gvmd container start). The last
+# start/end marker of each job wins. Prints "scap=<s> cert=<s> nvt=<s>", s = run|done|failed|none.
+# (gvmd no longer sets "gvmd: Updating…" process titles in current images, so titles cannot be used.)
+gvmd_job_states() {
+  local since="${1:-$(svc_started_at gvmd)}"
+  { dc logs --no-log-prefix --since "$since" gvmd 2>/dev/null || true; } | awk '
+    /update_scap: Updating data from feed|rebuilding SCAP db/ { s = "run" }
+    /Updating SCAP info succeeded/                            { s = "done" }
+    /(update_scap|SCAP info).*[Ff]ailed/                      { s = "failed" }
+    /sync_cert: Updating data from feed/                      { c = "run" }
+    /Updating CERT info succeeded/                            { c = "done" }
+    /(sync_cert|CERT info).*[Ff]ailed/                        { c = "failed" }
+    /different VT status.*Starting update/                    { n = "run" }
+    /Updating VTs in database \.\.\. done/                    { n = "done" }
+    /(Updating VTs|update_nvts|update_nvt_cache).*[Ff]ail/    { n = "failed" }
+    /manage: +INFO:/ && !/get_nvt_preference|update_dfn_xml|update_cert_bund_xml/ {
+      step = $0; sub(/^.*utc:[0-9]+: +/, "", step); sub(/^Updating \/var\/lib\/gvm\//, "reading ", step) }
+    END { printf "scap=%s cert=%s nvt=%s step=%s\n", s ? s : "none", c ? c : "none", n ? n : "none", step }'
+}
+
+# Bytes held by a leftover "scap2" schema from an aborted SCAP build, 0 if none (or if a build
+# is running). gvmd builds scap2 in a transaction that keeps locks on its tables, so a scap2
+# with no lock held by a client (autovacuum workers do not count) while no SCAP job runs is garbage - typically a build that hit a full disk, which
+# leaves ~25 GB behind and the disk at 100% (PostgreSQL can then no longer write anything).
+scap2_leftover_bytes() {
+  local b
+  b="$(pg_q "SELECT CASE WHEN to_regnamespace('scap2') IS NULL THEN 0
+      WHEN EXISTS (SELECT 1 FROM pg_locks l JOIN pg_class c ON c.oid = l.relation
+                   JOIN pg_namespace n ON n.oid = c.relnamespace
+                   JOIN pg_stat_activity a ON a.pid = l.pid
+                   WHERE n.nspname = 'scap2' AND a.backend_type = 'client backend') THEN 0
+      ELSE (SELECT coalesce(sum(pg_total_relation_size(c.oid)), 0) FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = 'scap2' AND c.relkind IN ('r', 'm')) END")"
+  [[ "$b" =~ ^[0-9]+$ ]] || b=0
+  if (( b > 0 )) && [[ "${FW_JOBS:-$(gvmd_job_states)}" == *scap=run* ]]; then b=0; fi
+  printf '%s' "$b"
+}
+
+# Drop an aborted scap2 build (gvmd starts every SCAP build from scratch anyway). Prints freed bytes.
+drop_scap2_leftover() {
+  local b; b="$(scap2_leftover_bytes)"
+  (( b > 0 )) || { printf '0'; return 0; }
+  pg_q "DROP SCHEMA IF EXISTS scap2 CASCADE" >/dev/null
+  printf '%s' "$b"
+}
+
+# Number of times the kernel OOM killer killed gvmd/postgres in the last hour. With too little
+# RAM (and no swap) gvmd's NVT import child (~2.5 GB) is killed every couple of minutes and
+# gvmd restarts the import forever without logging anything: the import never ends.
+oom_kills_recent() {
+  journalctl -k --since -1h --no-pager 2>/dev/null | grep -cE 'Killed process [0-9]+ \((gvmd|postgres)\)' || true
+}
+
+# Current gvmd feed activity as a short comma-separated text (empty when idle)
 gvmd_activity() {
-  dc exec -T gvmd sh -c 'for f in /proc/[0-9]*/cmdline; do tr "\0" " " < "$f" 2>/dev/null; echo; done' 2>/dev/null \
-    | grep -E '^gvmd: ' | grep -viE 'waiting for incoming|serving client|^gvmd: main' | sed 's/^gvmd: //; s/ *$//' | sort -u | paste -sd ',' -
+  local st acts=()
+  st="${FW_JOBS:-$(gvmd_job_states)}"
+  [[ "$st" == *scap=run* ]] && acts+=("updating SCAP (CVE/CPE)")
+  [[ "$st" == *cert=run* ]] && acts+=("updating CERT advisories")
+  [[ "$st" == *nvt=run* ]]  && acts+=("importing NVTs")
+  local out="" a step
+  for a in "${acts[@]}"; do out+="${out:+, }$a"; done
+  # Last step gvmd announced: long steps (one UPDATE can run 45 min on a slow disk) show progress
+  step="${st#*step=}"; [[ "$st" == *step=* ]] || step=""
+  [[ -n "$out" && -n "$step" ]] && out+=" — ${step:0:60}"
+  # One SQL statement can run for hours on a slow disk with little RAM: show how long, so a
+  # quiet dashboard is not mistaken for a hang
+  if [[ -n "$out" ]]; then
+    local q
+    q="$(pg_q "SELECT extract(epoch FROM max(now() - query_start))::bigint FROM pg_stat_activity
+               WHERE datname = 'gvmd' AND usename = 'gvmd' AND state = 'active' AND backend_type = 'client backend'")"
+    if [[ "$q" =~ ^[0-9]+$ ]] && (( q >= 300 )); then out+=" (current SQL step running for $(fmt_duration "$q"))"; fi
+  fi
+  printf '%s' "$out"
 }
 
 # Last VT-loading message from ospd-openvas (gvmd only gets NVTs once ospd has loaded them into redis)
 ospd_vt_phase() {
   local line
-  line="$(dc logs --no-log-prefix --since 6h ospd-openvas 2>/dev/null \
+  line="$(dc logs --no-log-prefix --since "$(svc_started_at ospd-openvas)" ospd-openvas 2>/dev/null \
     | grep -iE 'loading vts|finished loading vts|vts were up to date|vt cache' | tail -1)" || true
   if [[ -z "$line" ]]; then printf 'unknown'
   elif grep -qiE 'finished|up to date|updated' <<<"$line"; then printf 'VTs loaded'
@@ -423,15 +596,6 @@ ospd_vt_phase() {
 }
 
 fmt_duration() { printf '%02d:%02d:%02d' $(( $1 / 3600 )) $(( $1 % 3600 / 60 )) $(( $1 % 60 )); }
-
-progress_bar() {
-  # progress_bar <done> <total> <width>
-  local done=$1 total=$2 width=$3 pct=0 fill
-  (( total > 0 )) && pct=$(( done * 100 / total ))
-  (( pct > 100 )) && pct=100
-  fill=$(( pct * width / 100 ))
-  printf '[%s%s] %3d%%' "$(printf '%*s' "$fill" '' | tr ' ' '#')" "$(printf '%*s' $(( width - fill )) '' | tr ' ' '-')" "$pct"
-}
 
 fmt_count() { if (( $1 < 0 )); then printf 'pending'; else printf "%'d" "$1"; fi; }
 
@@ -526,35 +690,74 @@ fw_extra() {
   printf '%s' "$out"
 }
 
-# Prints the dashboard once. Returns 0 when the import looks complete, 1 otherwise.
+# Prints the dashboard once. Returns 0 when the import is complete, 1 while in progress,
+# 2 when gvmd logged a failed feed job.
+# Optional globals set by 'update-feed --wait': FW_SINCE (time of the update) and
+# FW_NEED_SCAP / FW_NEED_CERT (1 = new data on disk: a finished job after FW_SINCE is required).
 feed_progress_once() {
   local counts nvt cve cpe cbund dfn cve2 cpe2 activity vtphase now elapsed v
-  counts="$(feed_db_counts)"
+  FW_LOCKED=0
+  counts="$(feed_db_counts)" || counts=""
   IFS='|' read -r nvt cve cpe cbund dfn cve2 cpe2 <<<"${counts:-||||||}"
-  for v in nvt cve cpe cbund dfn cve2 cpe2; do [[ "${!v}" =~ ^-?[0-9]+$ ]] || printf -v "$v" '%s' -1; done
-  activity="$(gvmd_activity || true)"
-  vtphase="$(ospd_vt_phase)"
+  for v in nvt cve cpe cbund dfn cve2 cpe2; do
+    [[ "${!v}" =~ ^-?[0-9]+$ ]] || printf -v "$v" '%s' -1
+    # -2: table locked by gvmd right now -> keep the previous value (or -1 if none yet)
+    if (( ${!v} == -2 )); then printf -v "$v" '%s' "${FW_PREVCOUNT[$v]:--1}"; FW_LOCKED=1; fi
+    FW_PREVCOUNT[$v]=${!v}
+  done
+  FW_JOBS="$(gvmd_job_states)" || FW_JOBS=""
+  activity="$(gvmd_activity)" || activity=""
+  vtphase="$(ospd_vt_phase)" || vtphase=unknown
+  local dv dbv; dv="$(disk_nvt_version)" || dv=unknown; dbv="$(db_nvt_version)" || dbv=none
   now=$(date +%s); elapsed=$(( now - FW_START ))
 
-  # SCAP is built in "scap2" then swapped: show the build counter until the swap
+  # SCAP is built in "scap2" then swapped: while scap2 exists, show its counters (on an update
+  # the old "scap" stays in place, and in use, until the swap)
   local cve_v=$cve cpe_v=$cpe cve_b=0 cpe_b=0
-  (( cve < 0 && cve2 >= 0 )) && { cve_v=$cve2; cve_b=1; }
-  (( cpe < 0 && cpe2 >= 0 )) && { cpe_v=$cpe2; cpe_b=1; }
+  (( cve2 >= 0 )) && { cve_v=$cve2; cve_b=1; }
+  (( cpe2 >= 0 )) && { cpe_v=$cpe2; cpe_b=1; }
 
   fw_track nvt "$nvt" "$now"; fw_track cve "$cve_v" "$now"; fw_track cpe "$cpe_v" "$now"
   fw_track cbund "$cbund" "$now"; fw_track dfn "$dfn" "$now"
 
-  local nvt_done=0
-  if (( FW_TOTAL > 0 )); then (( nvt * 100 >= FW_TOTAL * 98 )) && nvt_done=1
-  else (( nvt > 0 )) && [[ -z "$activity" ]] && nvt_done=1; fi
+  # NVTs are complete when gvmd's imported feed version matches the feed on disk. (Counting
+  # .nasl files is wrong: the database also holds ~100k Notus local-security checks.)
+  local nvt_done=0 nvt_note=""
+  if [[ "$dv" =~ ^[0-9]+$ ]]; then
+    [[ "$dbv" == "$dv" ]] && (( nvt > 0 )) && nvt_done=1
+  else
+    (( nvt > 0 )) && [[ "$FW_JOBS" != *nvt=run* ]] && nvt_done=1
+  fi
   local s_nvt s_cve s_cpe s_cb s_dfn
   s_nvt=$(fw_state nvt "$nvt" "$nvt_done" "$now")
-  # NVTs at 0 while ospd-openvas still loads VTs into redis is expected, not a stall
-  [[ "$s_nvt" == stall && "$vtphase" == "loading VTs into redis" ]] && s_nvt=run
+  if (( nvt_done )); then
+    s_nvt="done"; nvt_note="feed $(fmt_feed_version "$dv")"
+  elif [[ "$FW_JOBS" == *nvt=run* ]]; then
+    s_nvt=run; nvt_note="importing feed $(fmt_feed_version "$dv")"
+  elif [[ "$vtphase" == "loading VTs into redis" ]]; then
+    s_nvt=run; nvt_note="scanner is loading VTs first"
+  elif [[ "$FW_JOBS" == *scap=run* || "$FW_JOBS" == *cert=run* ]]; then
+    # gvmd imports NVTs only after the SecInfo (SCAP/CERT) sync: waiting here is normal
+    s_nvt=waiting; nvt_note="queued: gvmd imports NVTs after SCAP/CERT"
+  else
+    [[ "$s_nvt" == "done" ]] && s_nvt="run"
+    nvt_note="feed $(fmt_feed_version "$dv"), database $(fmt_feed_version "$dbv")"
+  fi
+  [[ "$s_nvt" == stall ]] && nvt_note+=" (stalled?)"
   s_cve=$(fw_state cve "$cve_v" "$(( !cve_b && cve > 0 ))" "$now")
   s_cpe=$(fw_state cpe "$cpe_v" "$(( !cpe_b && cpe > 0 ))" "$now")
   s_cb=$(fw_state cbund "$cbund" "$(( cbund > 0 ))" "$now")
   s_dfn=$(fw_state dfn "$dfn" "$(( dfn > 0 ))" "$now")
+  # A counter that does not move while gvmd's job is still running is not a stall: gvmd spends
+  # long minutes in post-processing steps (CPE matches, CVSS/EPSS updates) without new rows
+  if [[ "$FW_JOBS" == *scap=run* ]]; then
+    [[ "$s_cve" == stall ]] && s_cve=run
+    [[ "$s_cpe" == stall ]] && s_cpe=run
+  fi
+  if [[ "$FW_JOBS" == *cert=run* ]]; then
+    [[ "$s_cb" == stall ]] && s_cb=run
+    [[ "$s_dfn" == stall ]] && s_dfn=run
+  fi
 
   # Header: elapsed, spinner (proves the screen is refreshing), time since last change
   local spin="${G_SPIN[$(( FW_TICK % ${#G_SPIN[@]} ))]}" since
@@ -562,6 +765,7 @@ feed_progress_once() {
   if (( FW_LASTCHANGE == 0 )); then since="no change seen yet"
   elif (( now - FW_LASTCHANGE < 60 )); then since="last change $(( now - FW_LASTCHANGE ))s ago"
   else since="last change $(fmt_duration $(( now - FW_LASTCHANGE ))) ago"; fi
+  (( FW_LOCKED )) && since+=" (some tables locked by gvmd: last known values shown)"
   printf '%sElapsed %s%s  %s  %s%s%s\n' "$c_bold" "$(fmt_duration "$elapsed")" "$c_rst" "$spin" "$c_dim" "$since" "$c_rst"
 
   # Scanner (ospd-openvas) and gvmd activity
@@ -570,20 +774,16 @@ feed_progress_once() {
     unknown)      printf '  %-10s %s %s\n' "Scanner" "$(fw_icon unknown)" "state unknown (no VT loading message in logs)" ;;
     *)            printf '  %-10s %s %s\n' "Scanner" "$(fw_icon run)" "$vtphase" ;;
   esac
-  if [[ -n "$activity" ]]; then printf '  %-10s %s %s\n' "gvmd" "$(fw_icon run)" "$activity"
-  else printf '  %-10s %s %s\n' "gvmd" "$(fw_icon waiting)" "idle / no background task detected"; fi
+  local failed=""
+  [[ "$FW_JOBS" == *scap=failed* ]] && failed+=" SCAP"
+  [[ "$FW_JOBS" == *cert=failed* ]] && failed+=" CERT"
+  [[ "$FW_JOBS" == *nvt=failed* ]]  && failed+=" NVTs"
+  if [[ -n "$failed" ]]; then printf '  %-10s %s %s\n' "gvmd" "$(fw_icon stall)" "${c_err}FAILED:${failed}${c_rst} (sudo $APP_BIN logs gvmd)"
+  elif [[ -n "$activity" ]]; then printf '  %-10s %s %s\n' "gvmd" "$(fw_icon run)" "$activity"
+  else printf '  %-10s %s %s\n' "gvmd" "$(fw_icon waiting)" "idle (no feed job running)"; fi
 
-  # NVTs with progress bar + ETA from the smoothed rate
-  local eta="" r
-  r=$(fw_rate_pm nvt)
-  if [[ "$s_nvt" != "done" ]] && (( FW_TOTAL > 0 && nvt >= 0 && nvt < FW_TOTAL && r > 0 )); then eta="ETA $(fmt_duration $(( (FW_TOTAL - nvt) * 60 / r )))"; fi
-  if (( FW_TOTAL > 0 )); then
-    printf '  %-10s %s %s  %s / %s  %s %s\n' "NVTs" "$(fw_icon "$s_nvt")" \
-      "$(progress_bar "$(( nvt < 0 ? 0 : nvt ))" "$FW_TOTAL" 30)" \
-      "$(fw_value nvt "$(fmt_count "$nvt")" 8 "$s_nvt")" "$(fmt_count "$FW_TOTAL")" "$(fw_extra nvt "$s_nvt")" "$eta"
-  else
-    printf '  %-10s %s %s  %s\n' "NVTs" "$(fw_icon "$s_nvt")" "$(fw_value nvt "$(fmt_count "$nvt")" 10 "$s_nvt") (feed total unknown)" "$(fw_extra nvt "$s_nvt")"
-  fi
+  printf '  %-10s %s %s  %s%s%s %s\n' "NVTs" "$(fw_icon "$s_nvt")" "$(fw_value nvt "$(fmt_count "$nvt")" 10 "$s_nvt")" \
+    "$c_dim" "$nvt_note" "$c_rst" "$(fw_extra nvt "$s_nvt")"
 
   # One line per data source
   local label key val st build txt
@@ -601,16 +801,37 @@ feed_progress_once() {
     printf '  %-10s %s %s  %s\n' "$label" "$(fw_icon "$st")" "$(fw_value "$key" "$txt" 26 "$st")" "$(fw_extra "$key" "$st")"
   done
 
-  # Completion heuristic: no gvmd feed activity, NVTs >= 98% of the feed,
-  # SCAP swapped in and populated, counters stable over 3 consecutive polls
-  local sig="$nvt|$cve|$cpe|$cbund|$dfn"
+  # scap2 present but nobody building it: the SCAP build was aborted (usually: disk full)
+  if [[ -z "$activity" ]] && (( cve2 >= 0 )); then
+    local left; left="$(scap2_leftover_bytes)" || left=0
+    if (( left > 0 )); then
+      printf '  %s%s%s\n' "$c_err" "SCAP build aborted: $(human "$left") left in scap2 (disk full?). Fix: sudo $APP_BIN repair-feed" "$c_rst"
+      return 2
+    fi
+  fi
+  local ooms; ooms="$(oom_kills_recent)"
+  if (( ${ooms:-0} > 0 )) && [[ -n "$activity" ]]; then
+    printf '  %s%s%s\n' "$c_err" "gvmd/PostgreSQL killed ${ooms}x by the OOM killer in the last hour: the import restarts forever. Give the VM 8 GB RAM (or add swap), then restart." "$c_rst"
+    return 2
+  fi
+  [[ -n "$failed" ]] && return 2
+
+  # Completion: no gvmd feed job running, NVT versions match, SCAP swapped in (no scap2) and
+  # populated, CERT present, counters stable over 3 consecutive polls, and - after an
+  # update-feed with new SCAP/CERT data - gvmd finished those jobs after the update started.
+  local sig="$nvt|$cve|$cpe|$cbund|$dfn|$cve2|$dbv"
   if [[ "$sig" == "$FW_PREV" ]]; then FW_STABLE=$(( FW_STABLE + 1 )); else FW_STABLE=0; fi
   FW_PREV="$sig"
-  if [[ -z "$activity" ]] && (( cve > 0 && cpe > 0 && cbund >= 0 && dfn >= 0 && (FW_STABLE >= 2 || FW_ONESHOT) )) \
-     && (( FW_TOTAL == 0 || nvt * 100 >= FW_TOTAL * 98 )); then
-    return 0
+  [[ -z "$activity" ]] || return 1
+  (( FW_LOCKED )) && return 1   # gvmd is busy with locked tables: certainly not finished
+  (( nvt_done && cve > 0 && cpe > 0 && cve2 < 0 && cbund >= 0 && dfn >= 0 )) || return 1
+  (( FW_STABLE >= 2 || FW_ONESHOT )) || return 1
+  if (( ${FW_NEED_SCAP:-0} || ${FW_NEED_CERT:-0} )); then
+    local since_jobs; since_jobs="$(gvmd_job_states "$FW_SINCE")" || since_jobs=""
+    (( ${FW_NEED_SCAP:-0} )) && [[ "$since_jobs" != *scap=done* ]] && return 1
+    (( ${FW_NEED_CERT:-0} )) && [[ "$since_jobs" != *cert=done* ]] && return 1
   fi
-  return 1
+  return 0
 }
 
 cmd_feed_status() {
@@ -627,15 +848,19 @@ cmd_feed_status() {
   done
 
   FW_START=$(date +%s); FW_PREV=""; FW_STABLE=0; FW_TICK=0; FW_LASTCHANGE=0; FW_ONESHOT=0
-  declare -gA FW_LAST=() FW_CHG_T=() FW_CHANGED=() FW_DELTA=() FW_HIST=()
+  declare -gA FW_LAST=() FW_CHG_T=() FW_CHANGED=() FW_DELTA=() FW_HIST=() FW_PREVCOUNT=()
   fw_init_glyphs
-  FW_TOTAL="$(feed_nvt_total)"; [[ "$FW_TOTAL" =~ ^[0-9]+$ ]] || FW_TOTAL=0
 
   if (( ! watch )); then
     FW_ONESHOT=1   # single shot: no stability requirement (only one sample)
-    if feed_progress_once; then ok "Feed looks fully loaded — ready to scan."
-    else warn "Feed import in progress — follow it with: sudo $APP_BIN feed-status --watch"; fi
-    return
+    local rc1=0
+    feed_progress_once || rc1=$?
+    case "$rc1" in
+      0) ok "Feed looks fully loaded — ready to scan." ;;
+      2) warn "gvmd reported a failed feed import — check: sudo $APP_BIN logs gvmd"; return 1 ;;
+      *) warn "Feed import in progress — follow it with: sudo $APP_BIN feed-status --watch" ;;
+    esac
+    return 0
   fi
 
   local prev_lines=0 tty=0 last_log=0 rc out
@@ -651,14 +876,14 @@ cmd_feed_status() {
 
   while :; do
     # Run in the current shell (not a pipe) so poll-to-poll state is kept
-    if feed_progress_once >"$out"; then rc=0; else rc=1; fi
+    rc=0; feed_progress_once >"$out" || rc=$?
     if (( tty )); then
       # Move back up by exactly what was drawn last time, redraw, clear anything left below
       (( prev_lines > 0 )) && printf '\e[%dA\r' "$prev_lines"
       sed $'s/$/\e[K/' "$out"
       printf '\e[J'
       prev_lines=$(wc -l <"$out")
-    elif (( rc == 0 || $(date +%s) - last_log >= 300 )); then
+    elif (( rc != 1 || $(date +%s) - last_log >= 300 )); then
       cat "$out"; last_log=$(date +%s)               # journald: one summary every 5 min
     fi
 
@@ -667,6 +892,12 @@ cmd_feed_status() {
       rm -f "$out"; trap - INT TERM
       ok "Feed fully loaded in $(fmt_duration $(( $(date +%s) - FW_START ))) — ready to scan."
       return 0
+    fi
+    if (( rc == 2 )); then
+      restore_term
+      rm -f "$out"; trap - INT TERM
+      warn "gvmd reported a failed feed import — check: sudo $APP_BIN logs gvmd"
+      return 1
     fi
     if (( timeout > 0 && $(date +%s) - FW_START >= timeout )); then
       restore_term
@@ -1069,7 +1300,7 @@ restore_bootstrap() {
   if ! service_running pg-gvm || ! service_running gvmd; then
     info "Starting the stack…"
     require_docker start
-    dc up -d >/dev/null
+    dc_up_patient >/dev/null || die "The stack did not start: sudo $APP_BIN logs <service>"
   fi
   wait_restore_ready
 }
@@ -1178,7 +1409,7 @@ cmd_restore() {
   fi
 
   info "Starting gvmd and gsad…"
-  dc up -d gvmd gsad >/dev/null
+  dc_up_patient gvmd gsad >/dev/null || die "gvmd/gsad did not start: sudo $APP_BIN logs gvmd"
   rm -rf -- "$tmpdir"
   if [[ "$b_mode" == scan ]]; then
     ok "Mission data restored (targets, credentials, configs, tasks, reports)."
@@ -1235,6 +1466,19 @@ cmd_doctor() {
   if (( mem_gb >= 7 )); then d_ok "RAM: ~${mem_gb} GB"
   elif (( mem_gb >= 4 )); then d_warn "RAM: ~${mem_gb} GB (8 GB recommended)"
   else d_fail "RAM: ~${mem_gb} GB (gvmd + PostgreSQL + scanner need 8 GB)"; fi
+  local swap_kb; swap_kb="$(awk '/SwapTotal/{print $2}' /proc/meminfo)" || swap_kb=0
+  if (( mem_gb < 7 && ${swap_kb:-0} == 0 )); then
+    d_warn "No swap with less than 8 GB RAM: gvmd's NVT import (~2.5 GB) gets OOM-killed in a loop. Fix:"
+    d_info "  fallocate -l 4G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+    d_info "  echo '/swapfile none swap sw 0 0' >> /etc/fstab"
+  fi
+  local ooms; ooms="$(journalctl -k --since -7d --no-pager 2>/dev/null | grep -ciE 'out of memory|oom-kill' || true)"
+  local ooms_h; ooms_h="$(oom_kills_recent)"
+  if (( ${ooms_h:-0} > 0 )); then
+    d_fail "gvmd/PostgreSQL OOM-killed ${ooms_h}x in the last hour: the feed import loops and never finishes (8 GB RAM or swap needed)"
+  elif (( ${ooms:-0} > 0 )); then
+    d_warn "Kernel OOM killer fired ${ooms} time(s) in 7 days (a killed gvmd/PostgreSQL leaves the feed import stuck): give the VM more RAM"
+  fi
   local ntp; ntp="$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" || ntp=""
   case "$ntp" in
     yes) d_ok "Clock: NTP-synchronized" ;;
@@ -1254,6 +1498,10 @@ cmd_doctor() {
     d_warn "Looks like $nat (gateway $gw, virt: $virt): ARP/ICMP host discovery and LAN scans will be degraded — use bridged networking"
   else
     d_ok "Interface $iface ${ip:-?} via $gw (virtualization: $virt)"
+  fi
+  if [[ "$virt" == oracle ]]; then
+    d_info "VirtualBox guest: prefer a fixed-size disk on SSD, 8 GB RAM, bridged network; keep the VM"
+    d_info "  awake during a feed import (pausing/saving the VM mid-import stretches it, see feed-status)"
   fi
   local code; code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 https://registry.community.greenbone.net/v2/ 2>/dev/null)" || code="000"
   if [[ "$code" =~ ^(200|401)$ ]]; then d_ok "Greenbone registry reachable (install/update possible)"
@@ -1276,9 +1524,36 @@ cmd_doctor() {
     [[ -d "$root" ]] || root=/
     avail_gb="$(df -B1 --output=avail "$root" 2>/dev/null | tail -1 | tr -dc '0-9')"
     avail_gb=$(( ${avail_gb:-0} / 1024 / 1024 / 1024 ))
-    if (( avail_gb >= 20 )); then d_ok "Free space on $root: ${avail_gb} GB"
-    elif (( avail_gb >= 10 )); then d_warn "Free space on $root: ${avail_gb} GB (feed + database can grow past 20 GB)"
+    local size_gb; size_gb="$(df -B1 --output=size "$root" 2>/dev/null | tail -1 | tr -dc '0-9')" || size_gb=0
+    size_gb=$(( ${size_gb:-0} / 1024 / 1024 / 1024 ))
+    if (( size_gb > 0 && size_gb < 90 )); then
+      d_warn "Filesystem of $root is ${size_gb} GB: a loaded stack uses ~55 GB and a SCAP update needs ~25 GB more at its peak (100 GB disk recommended)"
+    fi
+    if [[ -f "$GB_DIR/docker-compose.yml" ]] && gvmd_running && service_running pg-gvm; then
+      local need free; need="$(feed_update_need_bytes "${FEED_SERVICES[@]}")"; free="$(docker_free_bytes)"
+      if (( free >= need )); then d_ok "Free space: $(human "$free") (next feed update needs up to $(human "$need"))"
+      else d_fail "Free space: $(human "$free") < $(human "$need") needed by the next feed update (new images + SCAP rebuild): update-feed will refuse"; fi
+    elif (( avail_gb >= 30 )); then d_ok "Free space on $root: ${avail_gb} GB"
+    elif (( avail_gb >= 15 )); then d_warn "Free space on $root: ${avail_gb} GB (installed stack + feed + database need ~55 GB)"
     else d_fail "Free space on $root: ${avail_gb} GB (too low)"; fi
+    # Raw read throughput of the disk holding Docker data (O_DIRECT, 256 MB, read-only): the SCAP
+    # import is I/O bound, and on a slow virtual disk with little RAM one import takes hours
+    local src mbps ddbin=dd
+    command -v gnudd >/dev/null && ddbin=gnudd   # Ubuntu 25.10+: uutils dd lacks iflag=direct
+    src="$(findmnt -no SOURCE --target "$root" 2>/dev/null | sed 's/\[.*//')" || src=""
+    if [[ -b "$src" ]]; then
+      mbps="$("$ddbin" if="$src" of=/dev/null bs=1M count=256 iflag=direct 2>&1 | awk '/copied/ { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9.,]+$/ && $(i+1) ~ /^[MG]B\/s$/) { v = $i; sub(",", ".", v); print ($(i+1) == "GB/s" ? v * 1000 : v) + 0 } }')" || mbps=""
+      if [[ "$mbps" =~ ^[0-9.]+$ ]]; then
+        if (( ${mbps%.*} >= 150 )); then d_ok "Disk read speed: ~${mbps%.*} MB/s"
+        else d_warn "Disk read speed: ~${mbps%.*} MB/s (slow: a SCAP import can take hours; prefer SSD-backed, fixed-size virtual disks and 8 GB RAM)"; fi
+      fi
+    fi
+    local dang dang_b=0 id s
+    dang="$(docker images -f dangling=true -q 2>/dev/null | sort -u)" || dang=""
+    for id in $dang; do s="$(docker image inspect -f '{{.Size}}' "$id" 2>/dev/null)" || s=0; dang_b=$(( dang_b + ${s:-0} )); done
+    if (( dang_b > 1024 ** 3 )); then
+      d_warn "$(human "$dang_b") of unused (dangling) images, e.g. old feed versions: docker image prune"
+    fi
   fi
 
   d_section "Greenbone"
@@ -1313,6 +1588,10 @@ cmd_doctor() {
       elif (( age <= 7 )); then d_ok "Feed $(fmt_feed_version "$fv") (${age} days old)"
       elif (( age <= 30 )); then d_info "Feed $(fmt_feed_version "$fv") (${age} days old — frozen? update before a mission)"
       else d_warn "Feed $(fmt_feed_version "$fv") is ${age} days old: recent CVEs are missing"; fi
+      local left; left="$(scap2_leftover_bytes)" || left=0
+      if (( left > 0 )); then
+        d_fail "Aborted SCAP build left $(human "$left") in the database (scap2), usually after a full disk: sudo $APP_BIN repair-feed"
+      fi
     fi
   fi
 
@@ -1379,15 +1658,53 @@ cmd_logs() {
 
 gvmd_running() { [[ -n "$(dc ps --status running -q gvmd 2>/dev/null)" ]]; }
 
+# Free bytes where images and volumes live (Docker root and, with the containerd image
+# store of Docker 29+, /var/lib/containerd): the smallest of the two
+docker_free_bytes() {
+  local root a b
+  root="$(docker info --format '{{.DockerRootDir}}' 2>/dev/null)" || root=""
+  [[ -d "$root" ]] || root=/var/lib/docker
+  [[ -d "$root" ]] || root=/
+  a="$(df -B1 --output=avail "$root" 2>/dev/null | tail -1 | tr -dc '0-9')" || a=0
+  if [[ -d /var/lib/containerd ]]; then
+    b="$(df -B1 --output=avail /var/lib/containerd 2>/dev/null | tail -1 | tr -dc '0-9')" || b=$a
+    (( ${b:-0} < ${a:-0} )) && a=$b
+  fi
+  printf '%s' "${a:-0}"
+}
+
+# Bytes the next feed update may need at its peak: the new feed images are pulled while the old
+# ones still exist, and on a SCAP update gvmd rebuilds the whole SCAP schema in "scap2" next to
+# the live one before swapping them (measured: ~24 GB of PostgreSQL data in 2026).
+feed_update_need_bytes() {
+  local img=0 scap id s
+  for id in $(dc images -q "$@" 2>/dev/null | sort -u); do
+    s="$(docker image inspect -f '{{.Size}}' "$id" 2>/dev/null)" || s=0
+    img=$(( img + ${s:-0} ))
+  done
+  scap="$(pg_q "select coalesce(sum(pg_total_relation_size(c.oid)),0) from pg_class c join pg_namespace n on n.oid = c.relnamespace where n.nspname = 'scap' and c.relkind in ('r','m')")"
+  [[ "$scap" =~ ^[0-9]+$ ]] || scap=0
+  (( img == 0 )) && img=$(( 8 * 1024 ** 3 ))   # first run / unknown: feed images are ~8 GB
+  printf '%s' $(( img + scap + 5 * 1024 ** 3 ))
+}
+
 cmd_update_feed() {
   require_root; require_compose_file; require_docker start
   require_unlocked "update-feed"
-  local wait=0
-  case "${1:-}" in
-    --wait) wait=1 ;;
-    "") ;;
-    *) die "Unknown option: $1 (expected: --wait)" ;;
-  esac
+  local wait=0 force=0
+  while (( $# )); do
+    case "$1" in
+      --wait)  wait=1 ;;
+      --force) force=1 ;;
+      *) die "Unknown option: $1 (expected: --wait, --force)" ;;
+    esac
+    shift
+  done
+
+  # One update at a time: the nightly timer and a manual run must not overwrite the volumes
+  # while the other is pulling or while gvmd reads them
+  exec 9>"$GB_FEED_LOCK"
+  flock -n 9 || die "Another feed update is already running (lock $GB_FEED_LOCK)."
 
   # Keep only feed services actually defined in the compose file
   local available svc; available="$(dc config --services)"
@@ -1397,20 +1714,71 @@ cmd_update_feed() {
   done
   (( ${#feeds[@]} )) || die "No feed service found — compare FEED_SERVICES with '$APP_BIN services'."
 
+  # A previous SCAP build that died (disk full) leaves scap2 behind: reclaim it first
+  local freed0; freed0="$(drop_scap2_leftover)" || freed0=0
+  (( freed0 > 0 )) && warn "Removed an aborted SCAP build (scap2, $(human "$freed0")) left by a previous update."
+
+  # Disk space: a feed update that fills the disk in the middle of gvmd's SCAP rebuild leaves
+  # PostgreSQL and gvmd in a bad state, so check before downloading anything
+  local need free
+  need="$(feed_update_need_bytes "${feeds[@]}")"; free="$(docker_free_bytes)"
+  if (( free < need )); then
+    local msg
+    msg="Free space $(human "$free") < $(human "$need") needed at the peak of a feed update (new images + SCAP rebuild)."
+    if (( force )); then warn "$msg Continuing (--force)."
+    else
+      warn "$msg"
+      warn "Grow the VM disk (and the partition/filesystem), or free space: sudo $APP_BIN disk"
+      die "Feed update refused to avoid filling the disk. Override with --force."
+    fi
+  fi
+
+  # Feed versions before the update (only readable while the stack runs)
+  local up=0 nvt0="" scap0="" cert0="" nvt1 scap1 cert1
+  if gvmd_running && service_running ospd-openvas; then
+    up=1; nvt0="$(disk_nvt_version)"; scap0="$(disk_secinfo_version scap)"; cert0="$(disk_secinfo_version cert)"
+  fi
+  local old_ids; old_ids="$(dc images -q "${feeds[@]}" 2>/dev/null | sort -u)" || old_ids=""
+
   info "Pulling feed images: ${feeds[*]}"
-  dc pull -q "${feeds[@]}"
+  dc_pull_retry -q "${feeds[@]}" || die "Feed pull failed: the data already in place was not touched."
+  local since; since="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   info "Copying data into volumes…"
-  dc up -d "${feeds[@]}"
+  dc_up_patient "${feeds[@]}" || die "Copying the feed into the volumes failed: sudo $APP_BIN logs ${feeds[*]}"
+
+  # Old feed images are no longer used by any container: without this, each update leaves
+  # several GB of dangling images behind and a nightly schedule fills the VM disk in days
+  local new_ids id freed=0 s
+  new_ids="$(dc images -q "${feeds[@]}" 2>/dev/null | sort -u)" || new_ids=""
+  for id in $old_ids; do
+    grep -qx "$id" <<<"$new_ids" && continue
+    s="$(docker image inspect -f '{{.Size}}' "$id" 2>/dev/null)" || s=0
+    if docker image rm "$id" >/dev/null 2>&1; then freed=$(( freed + ${s:-0} )); fi
+  done
+  (( freed > 0 )) && info "Removed previous feed images ($(human "$freed") freed)."
 
   if ! gvmd_running; then
     warn "gvmd is not running: the import will happen on the next '$APP_BIN start'."
     return
   fi
+
+  local need_scap=0 need_cert=0 changed=()
+  if (( up )); then
+    nvt1="$(disk_nvt_version)"; scap1="$(disk_secinfo_version scap)"; cert1="$(disk_secinfo_version cert)"
+    [[ "$nvt1" != "$nvt0" ]]  && changed+=("NVTs $(fmt_feed_version "$nvt0") → $(fmt_feed_version "$nvt1")")
+    [[ "$scap1" != "$scap0" ]] && { need_scap=1; changed+=("SCAP $(fmt_feed_version "$scap0") → $(fmt_feed_version "$scap1")"); }
+    [[ "$cert1" != "$cert0" ]] && { need_cert=1; changed+=("CERT $(fmt_feed_version "$cert0") → $(fmt_feed_version "$cert1")"); }
+    if (( ${#changed[@]} == 0 )); then
+      ok "No new NVT/SCAP/CERT data, nothing to import (NVTs $(fmt_feed_version "$nvt1"), SCAP $(fmt_feed_version "$scap1"), CERT $(fmt_feed_version "$cert1"))."
+      return
+    fi
+    local c; for c in "${changed[@]}"; do info "New data: $c"; done
+  fi
   ok "Feed data updated — gvmd is re-importing in the background."
 
   if (( wait )); then
-    sleep 20   # give gvmd time to notice the new feed data
-    cmd_feed_status --watch
+    # The dashboard only reports "ready" once gvmd has imported these exact versions
+    FW_SINCE="$since" FW_NEED_SCAP=$need_scap FW_NEED_CERT=$need_cert cmd_feed_status --watch
   else
     info "Follow-up: sudo $APP_BIN feed-status --watch"
   fi
@@ -1493,6 +1861,22 @@ cmd_schedule_feed() {
   esac
 }
 
+# ---------- Repair after a failed feed import ----------
+cmd_repair_feed() {
+  require_root; require_compose_file; require_docker start
+  service_running pg-gvm || die "PostgreSQL (pg-gvm) is not running: sudo $APP_BIN start"
+  local freed=0 b id s
+  b="$(drop_scap2_leftover)" || b=0
+  if (( b > 0 )); then ok "Dropped an aborted SCAP build (scap2): $(human "$b") freed."; freed=$(( freed + b ))
+  else info "No aborted SCAP build in the database."; fi
+  for id in $(docker images -f dangling=true -q 2>/dev/null | sort -u); do
+    s="$(docker image inspect -f '{{.Size}}' "$id" 2>/dev/null)" || s=0
+    if docker image rm "$id" >/dev/null 2>&1; then freed=$(( freed + ${s:-0} )); fi
+  done
+  ok "Total freed: $(human "$freed"). Free space now: $(human "$(docker_free_bytes)")."
+  info "gvmd retries the SCAP import on its own; make room first if the disk is too small (sudo $APP_BIN doctor)."
+}
+
 # ---------- Software update ----------
 cmd_update() {
   require_root; require_compose_file; require_docker start
@@ -1504,8 +1888,8 @@ cmd_update() {
     [[ "$ans" =~ ^[yY]$ ]] || { info "Cancelled."; return; }
   fi
   fetch_compose
-  dc pull
-  dc up -d --remove-orphans
+  dc_pull_retry || die "Image pull failed: the running stack was not touched."
+  dc_up_patient --remove-orphans || die "The updated stack did not start: sudo $APP_BIN status / logs <service>"
   docker image prune -f >/dev/null
   wait_for_gsa || true
   ok "Stack updated."
@@ -1716,6 +2100,7 @@ Operation
 Feed & updates
   update-feed [--wait]       Update vulnerability data now (NVT, Notus, SCAP, CERT…)
   feed-status [--watch]      Feed import progress dashboard
+  repair-feed                Clean up after a failed import (aborted SCAP build, old images)
   schedule-feed <action>     Nightly feed update via systemd timer: enable | disable | status | run
   update [-y]                Update the software (compose + all images) — snapshot first!
   lock / unlock              Pin images (and thus the feed) to their current digests / release the pin
@@ -1846,25 +2231,42 @@ EOF
 Usage: sudo $APP_BIN doctor
 
 Read-only preflight checks, each reported OK / INFO / WARN / FAIL. Exit code 1 on any FAIL.
-  System:    supported distribution, architecture, CPUs (4+), RAM (8 GB), NTP sync.
+  System:    supported distribution, architecture, CPUs (4+), RAM (8 GB), swap, recent OOM
+             kills, NTP sync.
   Network:   default route, and whether this VM sits behind a hypervisor NAT
              (VirtualBox 10.0.2.x, libvirt 192.168.122.1, UTM 192.168.64.1, VMware vmnet8,
              Hyper-V Default Switch). NAT breaks ARP/ICMP host discovery: use bridged mode.
              Greenbone registry reachability (needed for install/update only).
-  Docker:    installed, running, compose plugin, free space on the Docker data dir.
+  Docker:    installed, running, compose plugin, disk size (100 GB recommended), free space
+             vs. what the next feed update needs, leftover (dangling) images.
   Greenbone: install present, lock state, restart loops / unhealthy containers, core
              services, ports 443/9392 free (when stopped), GSA reachable, feed age.
 Network checks are heuristics: a WARN is a hint, not a verdict.
 EOF
     ;;
     update-feed) cat <<EOF
-Usage: sudo $APP_BIN update-feed [--wait]
+Usage: sudo $APP_BIN update-feed [--wait] [--force]
 
 Pulls the latest feed images (NVTs, Notus, SCAP, CERT-Bund, DFN-CERT, report formats, data
 objects, GPG keys) and copies them into the volumes; gvmd then re-imports in the background
 (minutes to tens of minutes). The software itself is not touched (see 'update').
-  --wait   follow the import with the 'feed-status --watch' dashboard.
+  --wait   follow the import with the 'feed-status --watch' dashboard; it only reports
+           "ready" once gvmd has imported the new NVT/SCAP/CERT versions.
+  --force  run even if free disk space looks too small (see below).
+Safety: refuses to start when free space is below what the update needs at its peak (new
+images + gvmd's SCAP rebuild next to the live data, ~35 GB in 2026); pulls are retried
+(GB_PULL_RETRIES); previous feed images are removed afterwards; only one run at a time.
 Disabled while the stack is locked. Run it right before a mission to start from fresh data.
+EOF
+    ;;
+    repair-feed) cat <<EOF
+Usage: sudo $APP_BIN repair-feed
+
+Cleans up after a feed import that died, typically because the disk filled up while gvmd was
+rebuilding SCAP data: drops the half-built "scap2" schema (~25 GB; the live SCAP data is not
+touched) and removes dangling images such as previous feed versions. gvmd then retries the
+SCAP import on its own - grow the disk first if it is too small (doctor tells).
+'update-feed' performs the scap2 cleanup automatically before downloading.
 EOF
     ;;
     feed-status) cat <<EOF
@@ -1873,15 +2275,17 @@ Usage: sudo $APP_BIN feed-status [--watch [--timeout <min>]]
 Shows how far gvmd is in importing the feed. gvmd exposes no percentage, so progress is
 derived from the database:
   Scanner    ospd-openvas loading VTs into redis (NVTs stay at 0 until this is done)
-  gvmd       current background task (from gvmd process titles)
-  NVTs       progress bar vs. the number of .nasl files in the feed, rate and ETA
+  gvmd       feed jobs running (SCAP, CERT, NVT import), from gvmd's start/end log messages
+  NVTs       count; done when gvmd's imported feed version equals the feed on disk
+             (gvmd imports NVTs only after SCAP/CERT: "queued" meanwhile is normal)
   CVEs/CPEs  counters; "building" while gvmd fills the temporary scap2 schema
   CERT-Bund / DFN-CERT counters
 Icons: ✓ done, ⟳ in progress, · waiting, ! no change for ${FW_STALL}s (stalled?).
 Values that changed since the previous refresh are highlighted in green with their delta.
   --watch            refresh every ${FEED_POLL}s until the import looks complete
   --timeout <min>    give up after <min> minutes (exit code 1)
-Completion is a heuristic (no activity, NVTs ≥ 98%, SCAP and CERT present, stable counters).
+Completion: no gvmd feed job running, NVT versions match, SCAP swapped in and CERT present,
+stable counters. Tables locked by gvmd keep their last known value (noted in the header).
 Env: FEED_POLL (seconds), FW_STALL (seconds), VAS_ASCII=1 (ASCII icons).
 EOF
     ;;
@@ -2067,6 +2471,9 @@ Environment variables (prefix the command, e.g. sudo GB_DIR=/srv/gb $APP_BIN sta
   GB_COMPOSE_URL    official compose file URL
   GB_GSA_URL        URL used to check GSA (default https://127.0.0.1)
   GB_START_TIMEOUT  seconds to wait for GSA on start (default 600)
+  GB_PULL_RETRIES   attempts per image pull (default 4, exponential backoff from 15 s)
+  GB_DATA_COPY_TIMEOUT  max seconds for feed containers to copy data into volumes on a slow
+                    disk before 'start' gives up (default 5400)
   GB_FEED_SCHEDULE  systemd OnCalendar for schedule-feed (default "*-*-* 01:00:00")
   FEED_POLL         feed-status refresh interval in seconds (default 15)
   FW_STALL          seconds without change before a counter is flagged stalled (default 600)
@@ -2081,7 +2488,7 @@ EOF
 }
 
 HELP_TOPICS=(install passwd self-install start stop restart status versions disk logs services doctor
-             update-feed feed-status schedule-feed update lock unlock backup restore
+             update-feed feed-status repair-feed schedule-feed update lock unlock backup restore
              backup-scan restore-scan
              export-bundle import-bundle uninstall version env)
 
@@ -2105,7 +2512,8 @@ case "${1:-}" in
   versions)       banner; cmd_versions ;;
   disk)           cmd_disk ;;
   doctor)         banner; cmd_doctor || exit 1 ;;
-  update-feed)    cmd_update_feed "${2:-}" ;;
+  update-feed)    shift; cmd_update_feed "$@" ;;
+  repair-feed)    cmd_repair_feed ;;
   feed-status)    shift; cmd_feed_status "$@" || exit 1 ;;
   schedule-feed)  cmd_schedule_feed "${2:-status}" ;;
   update)         if [[ "${2:-}" =~ ^(-y|--yes)$ ]]; then ASSUME_YES=1; fi; banner; cmd_update ;;
